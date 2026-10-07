@@ -1,4 +1,4 @@
-# v2 - QRIS support - 07/10/2026
+# v3 - force rebuild
 import os
 import io
 import asyncio
