@@ -365,8 +365,27 @@ async def on_ready():
         print(f"❌ Sync error: {e}")
 
 
+# === DEBUG ENV (buat cek Railway variables) ===
+def debug_env():
+    print("=" * 50)
+    print("=== DEBUG ENVIRONMENT ===")
+    print(f"Total env keys: {len(os.environ)}")
+    print(f"Env keys mengandung 'DISCORD': {[k for k in os.environ if 'DISCORD' in k.upper()]}")
+    print(f"Env keys mengandung 'API': {[k for k in os.environ if 'API' in k.upper()]}")
+    print(f"DISCORD_TOKEN present: {bool(DISCORD_TOKEN)}")
+    print(f"DISCORD_TOKEN length: {len(DISCORD_TOKEN) if DISCORD_TOKEN else 0}")
+    print(f"DEFAULT_API_KEY present: {bool(DEFAULT_API_KEY)}")
+    print("=" * 50)
+
+
 # === RUN ===
 if __name__ == "__main__":
+    debug_env()
     if not DISCORD_TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN gak ada di .env!")
+        raise SystemExit(
+            "❌ DISCORD_TOKEN tidak ditemukan!\n"
+            "Pastikan sudah di-set di Railway Variables dengan nama PERSIS: DISCORD_TOKEN"
+        )
+    if not DEFAULT_API_KEY:
+        print("⚠️ Warning: DEFAULT_API_KEY kosong, user harus isi manual di /check")
     bot.run(DISCORD_TOKEN)
