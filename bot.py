@@ -1,4 +1,4 @@
-# v5 - add announcement auto-bump feature
+# v6 - force rebuild 11/10/2026 10:15
 import os
 import io
 import json
