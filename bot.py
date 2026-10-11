@@ -1,4 +1,4 @@
-# v7 - delete previous bump + /status role feature
+# v8 - status list + auto-refresh
 import os
 import io
 import json
@@ -7,7 +7,7 @@ import asyncio
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -26,10 +26,15 @@ MAX_POLLS = 600
 
 QRIS_DIR = Path(__file__).parent / "qris"
 ANON_DB = Path(__file__).parent / "anon_channels.json"
+STATUS_DB = Path(__file__).parent / "status_auto.json"
 
 BUMP_COOLDOWN = 5
+AUTO_STATUS_INTERVAL = 60  # detik
 
-# === KATEGORI COOKIE ===
+# Role yang dianggap "ON" (case-insensitive)
+ON_ROLES = ["WORKER ON", "OWNER ON", "WORKER", "OWNER"]
+
+# === KATEGORI ===
 CATEGORIES = [
     {"key": "alive",        "name": "Alive",        "emoji": "🟢"},
     {"key": "dead",         "name": "Dead",         "emoji": "🔴"},
@@ -48,16 +53,15 @@ COLOR_STATUS   = 0x5865f2
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = True
+intents.members = True  # WAJIB: aktifin Server Members Intent di Developer Portal
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# State in-memory
-_last_bump = {}         # {channel_id: timestamp}
-_last_bump_msg = {}     # {channel_id: Message} buat dihapus pas bump baru
+_last_bump = {}
+_last_bump_msg = {}
 
 
 # ============================================================
-# HELPER
+# HELPERS
 # ============================================================
 def progress_bar(current, total, length=20):
     if total <= 0:
@@ -130,6 +134,14 @@ def list_qris_available():
     return sorted(names)
 
 
+def check_user_status(member: discord.Member) -> bool:
+    """Return True kalau user punya role ON_ROLES."""
+    if not member or not hasattr(member, "roles"):
+        return False
+    user_roles = [r.name.upper() for r in member.roles]
+    return any(role.upper() in user_roles for role in ON_ROLES)
+
+
 # ============================================================
 # ANON DB
 # ============================================================
@@ -139,8 +151,7 @@ def load_anon_db() -> dict:
     try:
         with open(ANON_DB, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print(f"⚠️ Gagal load anon db: {e}")
+    except Exception:
         return {}
 
 
@@ -158,6 +169,53 @@ def is_anon_channel(channel_id: int) -> bool:
 
 def get_anon_config(channel_id: int) -> dict:
     return load_anon_db().get(str(channel_id), {})
+
+
+# ============================================================
+# STATUS DB (auto-refresh)
+# ============================================================
+def load_status_db() -> dict:
+    if not STATUS_DB.exists():
+        return {}
+    try:
+        with open(STATUS_DB, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_status_db(data: dict):
+    try:
+        with open(STATUS_DB, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Gagal save status db: {e}")
+
+
+# ============================================================
+# BUILD EMBED STATUS (multi-user)
+# ============================================================
+def build_status_embed(members: list, title: str = "📊 Status Worker") -> discord.Embed:
+    embed = discord.Embed(title=title, color=COLOR_STATUS)
+
+    if not members:
+        embed.description = "*Belum ada user yang di-set.*"
+        return embed
+
+    lines = []
+    for m in members:
+        if m is None:
+            lines.append("❔ *User tidak ditemukan*")
+            continue
+
+        is_on = check_user_status(m)
+        indicator = "🟢" if is_on else "🔴"
+        status_text = "ON" if is_on else "OFF"
+        lines.append(f"{indicator} {m.mention} — **{status_text}**")
+
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"🔄 Auto-refresh tiap 1 menit • Update: {discord.utils.utcnow().strftime('%H:%M:%S')} UTC")
+    return embed
 
 
 # ============================================================
@@ -351,6 +409,191 @@ async def pay(interaction: discord.Interaction, target: str):
 
 
 # ============================================================
+# SLASH COMMAND: /status
+# ============================================================
+@bot.tree.command(name="status", description="Cek status worker (single user)")
+@app_commands.describe(user="User yang mau dicek (opsional)")
+async def status(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+
+    is_on = check_user_status(target)
+    if is_on:
+        status_text = "🟢 **ON**"
+        status_desc = f"{target.mention} sedang **ON** — siap menerima order!"
+        color = COLOR_DONE
+    else:
+        status_text = "🔴 **OFF**"
+        status_desc = f"{target.mention} sedang **OFF** — lagi gak available."
+        color = COLOR_ERROR
+
+    embed = discord.Embed(
+        title=f"📊 Status — {target.display_name}",
+        description=status_desc,
+        color=color,
+    )
+    embed.add_field(name="Status", value=status_text, inline=True)
+    embed.add_field(name="User", value=target.mention, inline=True)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="Status berdasarkan role server")
+
+    await interaction.response.send_message(embed=embed)
+
+
+# ============================================================
+# SLASH COMMAND: /statuslist (multi-user, 1 embed)
+# ============================================================
+@bot.tree.command(name="statuslist", description="Cek status beberapa worker sekaligus (1 embed)")
+@app_commands.describe(
+    user1="User pertama",
+    user2="User kedua (opsional)",
+    user3="User ketiga (opsional)",
+    user4="User keempat (opsional)",
+    user5="User kelima (opsional)",
+)
+async def statuslist(
+    interaction: discord.Interaction,
+    user1: discord.Member,
+    user2: discord.Member = None,
+    user3: discord.Member = None,
+    user4: discord.Member = None,
+    user5: discord.Member = None,
+):
+    members = [u for u in [user1, user2, user3, user4, user5] if u is not None]
+
+    embed = build_status_embed(members, title="📊 Status Worker")
+    await interaction.response.send_message(embed=embed)
+
+
+# ============================================================
+# SLASH COMMAND: /statusauto (set auto-refresh)
+# ============================================================
+@bot.tree.command(name="statusauto", description="Set auto-refresh status di channel (tiap 1 menit)")
+@app_commands.describe(
+    channel="Channel buat nampilin status",
+    user1="User pertama",
+    user2="User kedua (opsional)",
+    user3="User ketiga (opsional)",
+    user4="User keempat (opsional)",
+    user5="User kelima (opsional)",
+)
+async def statusauto(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    user1: discord.Member,
+    user2: discord.Member = None,
+    user3: discord.Member = None,
+    user4: discord.Member = None,
+    user5: discord.Member = None,
+):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
+        )
+        return
+
+    members = [u for u in [user1, user2, user3, user4, user5] if u is not None]
+    user_ids = [str(u.id) for u in members]
+
+    await interaction.response.defer(thinking=True)
+
+    db = load_status_db()
+    ch_id = str(channel.id)
+
+    # Kirim pesan pertama
+    embed = build_status_embed(members, title="📊 Status Worker")
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Gagal kirim ke channel: `{e}`")
+        return
+
+    # Simpan config
+    db[ch_id] = {
+        "channel_id": ch_id,
+        "guild_id": str(interaction.guild_id),
+        "message_id": str(msg.id),
+        "user_ids": user_ids,
+        "set_by": str(interaction.user.id),
+        "set_at": str(discord.utils.utcnow()),
+    }
+    save_status_db(db)
+
+    embed_reply = discord.Embed(
+        title="✅ Auto-Status Di-set!",
+        description=(
+            f"**Channel:** {channel.mention}\n"
+            f"**Users:** {len(user_ids)} orang\n"
+            f"**Interval:** 1 menit\n\n"
+            f"Bot bakal update pesan di channel itu tiap 1 menit.\n"
+            f"Stop pakai `/statusautostop` di channel itu."
+        ),
+        color=COLOR_DONE,
+    )
+    await interaction.followup.send(embed=embed_reply, ephemeral=True)
+
+
+# ============================================================
+# SLASH COMMAND: /statusautostop
+# ============================================================
+@bot.tree.command(name="statusautostop", description="Stop auto-refresh status di channel ini")
+async def statusautostop(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
+        )
+        return
+
+    ch_id = str(interaction.channel_id)
+    db = load_status_db()
+
+    if ch_id not in db:
+        await interaction.response.send_message(
+            f"❌ Channel {interaction.channel.mention} bukan auto-status channel!",
+            ephemeral=True
+        )
+        return
+
+    del db[ch_id]
+    save_status_db(db)
+
+    await interaction.response.send_message(
+        f"🗑️ Auto-status di {interaction.channel.mention} udah dimatiin.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# SLASH COMMAND: /statusautolist
+# ============================================================
+@bot.tree.command(name="statusautolist", description="Lihat semua auto-status channel")
+async def statusautolist(interaction: discord.Interaction):
+    db = load_status_db()
+    guild_id = str(interaction.guild_id)
+
+    lines = []
+    for ch_id, cfg in db.items():
+        if cfg.get("guild_id") == guild_id:
+            ch = interaction.guild.get_channel(int(ch_id))
+            if ch:
+                lines.append(f"• {ch.mention} — {len(cfg.get('user_ids', []))} user")
+
+    if not lines:
+        await interaction.response.send_message(
+            "📭 Belum ada auto-status channel di server ini.\n\n"
+            "Set pakai `/statusauto`.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📊 Auto-Status Channels",
+        description="\n".join(lines),
+        color=COLOR_STATUS,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ============================================================
 # MODAL ANON
 # ============================================================
 class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
@@ -419,7 +662,7 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
 
 
 # === /setanon ===
-@bot.tree.command(name="setanon", description="Set channel ini jadi announcement (auto-bump pesan template)")
+@bot.tree.command(name="setanon", description="Set channel ini jadi announcement (auto-bump)")
 async def setanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
@@ -428,13 +671,10 @@ async def setanon(interaction: discord.Interaction):
         return
 
     ch_id = interaction.channel_id
-    db = load_anon_db()
-
-    if str(ch_id) in db:
+    if str(ch_id) in load_anon_db():
         await interaction.response.send_message(
-            f"⚠️ Channel {interaction.channel.mention} udah di-set!\n\n"
-            f"Pakai `/editanon` buat edit template.\n"
-            f"Pakai `/unsetanon` buat hapus setting.",
+            f"⚠️ Channel {interaction.channel.mention} udah di-set!\n"
+            f"Pakai `/editanon` buat edit, `/unsetanon` buat hapus.",
             ephemeral=True
         )
         return
@@ -443,7 +683,7 @@ async def setanon(interaction: discord.Interaction):
 
 
 # === /editanon ===
-@bot.tree.command(name="editanon", description="Edit template pesan announcement")
+@bot.tree.command(name="editanon", description="Edit template announcement")
 async def editanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
@@ -451,21 +691,17 @@ async def editanon(interaction: discord.Interaction):
         )
         return
 
-    ch_id = interaction.channel_id
-    db = load_anon_db()
-
-    if str(ch_id) not in db:
+    if str(interaction.channel_id) not in load_anon_db():
         await interaction.response.send_message(
-            f"❌ Channel {interaction.channel.mention} belum di-set.\nPakai `/setanon` dulu.",
-            ephemeral=True
+            f"❌ Channel {interaction.channel.mention} belum di-set.", ephemeral=True
         )
         return
 
-    await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="edit"))
+    await interaction.response.send_modal(AnonTemplateModal(channel_id=interaction.channel_id, mode="edit"))
 
 
 # === /unsetanon ===
-@bot.tree.command(name="unsetanon", description="Hapus setting announcement channel")
+@bot.tree.command(name="unsetanon", description="Hapus setting announcement")
 async def unsetanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
@@ -486,16 +722,13 @@ async def unsetanon(interaction: discord.Interaction):
     del db[ch_id]
     save_anon_db(db)
 
-    embed = discord.Embed(
-        title="🗑️ Setting Dihapus",
-        description=f"Channel {interaction.channel.mention} udah **gak jadi** announcement channel lagi.",
-        color=COLOR_DONE,
+    await interaction.response.send_message(
+        f"🗑️ Setting dihapus dari {interaction.channel.mention}.", ephemeral=True
     )
-    await interaction.response.send_message(embed=embed)
 
 
 # === /listanon ===
-@bot.tree.command(name="listanon", description="Lihat semua announcement channel di server ini")
+@bot.tree.command(name="listanon", description="Lihat semua announcement channel")
 async def listanon(interaction: discord.Interaction):
     db = load_anon_db()
     guild_id = str(interaction.guild_id)
@@ -509,8 +742,7 @@ async def listanon(interaction: discord.Interaction):
 
     if not lines:
         await interaction.response.send_message(
-            "📭 Belum ada announcement channel di server ini.\n\n"
-            "Set pakai `/setanon` di channel yang kamu mau.",
+            "📭 Belum ada announcement channel.\nSet pakai `/setanon`.",
             ephemeral=True
         )
         return
@@ -520,45 +752,7 @@ async def listanon(interaction: discord.Interaction):
         description="\n".join(lines),
         color=COLOR_ANON,
     )
-    embed.set_footer(text=f"Total: {len(lines)} channel")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ============================================================
-# SLASH COMMAND: /status (role-based)
-# ============================================================
-@bot.tree.command(name="status", description="Cek status worker (ON/OFF)")
-@app_commands.describe(user="User yang mau dicek statusnya (opsional)")
-async def status(interaction: discord.Interaction, user: discord.Member = None):
-    target = user or interaction.user
-
-    # Cek role WORKER / OWNER ON
-    # Ganti nama role di sini sesuai server kamu
-    ON_ROLES = ["WORKER ON", "OWNER ON", "WORKER", "OWNER"]
-
-    user_roles = [r.name.upper() for r in target.roles]
-    is_on = any(role.upper() in user_roles for role in ON_ROLES)
-
-    if is_on:
-        status_text = "🟢 **ON**"
-        status_desc = f"{target.mention} sedang **ON** — siap menerima order!"
-        color = COLOR_DONE
-    else:
-        status_text = "🔴 **OFF**"
-        status_desc = f"{target.mention} sedang **OFF** — lagi gak available."
-        color = COLOR_ERROR
-
-    embed = discord.Embed(
-        title=f"📊 Status — {target.display_name}",
-        description=status_desc,
-        color=color,
-    )
-    embed.add_field(name="Status", value=status_text, inline=True)
-    embed.add_field(name="User", value=target.mention, inline=True)
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.set_footer(text="Status berdasarkan role server")
-
-    await interaction.response.send_message(embed=embed)
 
 
 # === /ping ===
@@ -570,7 +764,7 @@ async def ping(interaction: discord.Interaction):
 
 
 # ============================================================
-# EVENT: ON MESSAGE — AUTO BUMP (with auto-delete previous)
+# EVENT: ON MESSAGE — AUTO BUMP
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -605,15 +799,15 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # === HAPUS BUMP SEBELUMNYA ===
+    # Hapus bump lama
     old_msg = _last_bump_msg.get(ch_id)
     if old_msg:
         try:
             await old_msg.delete()
         except discord.HTTPException:
-            pass  # udah kehapus / gak ada
+            pass
 
-    # === KIRIM BUMP BARU ===
+    # Kirim bump baru
     try:
         new_msg = await message.channel.send(template)
         _last_bump[ch_id] = now
@@ -622,6 +816,56 @@ async def on_message(message: discord.Message):
         print(f"[anon bump error] {e}")
 
     await bot.process_commands(message)
+
+
+# ============================================================
+# TASK: AUTO-REFRESH STATUS (tiap 1 menit)
+# ============================================================
+@tasks.loop(seconds=AUTO_STATUS_INTERVAL)
+async def auto_status_refresh():
+    db = load_status_db()
+    if not db:
+        return
+
+    for ch_id, cfg in list(db.items()):
+        try:
+            channel = bot.get_channel(int(ch_id))
+            if not channel:
+                continue
+
+            # Ambil member
+            members = []
+            for uid in cfg.get("user_ids", []):
+                try:
+                    m = await channel.guild.fetch_member(int(uid))
+                    members.append(m)
+                except Exception:
+                    members.append(None)
+
+            # Build embed
+            embed = build_status_embed(members, title="📊 Status Worker")
+
+            # Edit pesan lama
+            msg_id = cfg.get("message_id")
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(int(msg_id))
+                    await msg.edit(embed=embed)
+                    continue
+                except discord.NotFound:
+                    pass  # pesan kehapus, kirim ulang
+                except discord.HTTPException as e:
+                    print(f"[status refresh error] {e}")
+                    continue
+
+            # Kalau gak ada pesan, kirim baru
+            new_msg = await channel.send(embed=embed)
+            db[ch_id]["message_id"] = str(new_msg.id)
+            save_status_db(db)
+
+        except Exception as e:
+            print(f"[auto_status error] {e}")
+            continue
 
 
 # ============================================================
@@ -635,13 +879,12 @@ async def on_ready():
     print(f"🏠 Guilds: {[g.name for g in bot.guilds]}")
     print(f"📁 QRIS tersedia: {list_qris_available()}")
     print(f"📢 Anon channels: {list(load_anon_db().keys())}")
+    print(f"📊 Auto-status channels: {list(load_status_db().keys())}")
 
     # Sync global
     try:
         synced = await bot.tree.sync()
         print(f"✅ Global sync: {len(synced)} commands")
-        for cmd in synced:
-            print(f"   - /{cmd.name}")
     except Exception as e:
         print(f"❌ Global sync error: {e}")
 
@@ -653,6 +896,11 @@ async def on_ready():
             print(f"✅ Guild sync '{guild.name}': {len(guild_synced)} commands")
         except Exception as e:
             print(f"⚠️ Gagal sync ke guild '{guild.name}': {e}")
+
+    # Start auto-refresh task
+    if not auto_status_refresh.is_running():
+        auto_status_refresh.start()
+        print("🔄 Auto-status refresh task STARTED")
 
     print("=" * 60)
     print("🎉 Bot READY!")
