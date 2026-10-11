@@ -1,4 +1,4 @@
-# v6 - force rebuild 11/10/2026 10:15
+# v6 - guild sync for instant commands
 import os
 import io
 import json
@@ -26,11 +26,9 @@ MAX_POLLS = 600
 
 # Folder QRIS
 QRIS_DIR = Path(__file__).parent / "qris"
-
-# Database announcement channel
 ANON_DB = Path(__file__).parent / "anon_channels.json"
 
-# Cooldown bump (detik) - biar gak spam
+# Cooldown bump (detik)
 BUMP_COOLDOWN = 5
 
 # === KATEGORI ===
@@ -57,7 +55,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 _last_bump = {}
 
 
-# === HELPER ===
+# ============================================================
+# HELPER
+# ============================================================
 def progress_bar(current, total, length=20):
     if total <= 0:
         return "░" * length
@@ -120,7 +120,6 @@ def is_allowed(user_id: int) -> bool:
 
 
 def find_qris(name: str):
-    """Cari file QRIS di folder qris/"""
     if not QRIS_DIR.exists():
         return None
     name_lower = name.lower().strip()
@@ -132,7 +131,6 @@ def find_qris(name: str):
 
 
 def list_qris_available():
-    """List semua QRIS yang ada di folder"""
     if not QRIS_DIR.exists():
         return []
     names = set()
@@ -142,7 +140,9 @@ def list_qris_available():
     return sorted(names)
 
 
-# === ANON DB HELPERS ===
+# ============================================================
+# ANON DB
+# ============================================================
 def load_anon_db() -> dict:
     if not ANON_DB.exists():
         return {}
@@ -170,7 +170,9 @@ def get_anon_config(channel_id: int) -> dict:
     return load_anon_db().get(str(channel_id), {})
 
 
-# === SLASH COMMAND: /check ===
+# ============================================================
+# SLASH COMMAND: /check
+# ============================================================
 @bot.tree.command(name="check", description="Cek cookie Roblox (upload .txt atau paste)")
 @app_commands.describe(
     file="File .txt berisi cookies",
@@ -325,7 +327,9 @@ async def send_check_results(msg, session_id, data, api_key):
         await msg.edit(content=summary + "\n*(tidak ada file hasil)*", embed=None)
 
 
-# === SLASH COMMAND: /pay ===
+# ============================================================
+# SLASH COMMAND: /pay
+# ============================================================
 @bot.tree.command(name="pay", description="Tampilkan QRIS pembayaran")
 @app_commands.describe(target="Nama target (contoh: msky, bx, ame)")
 async def pay(interaction: discord.Interaction, target: str):
@@ -357,7 +361,7 @@ async def pay(interaction: discord.Interaction, target: str):
 
 
 # ============================================================
-# MODAL: INPUT TEMPLATE ANNOUNCEMENT
+# MODAL ANON
 # ============================================================
 class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
     template_input = discord.ui.TextInput(
@@ -373,7 +377,6 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
         self.channel_id = channel_id
         self.mode = mode
 
-        # Pre-fill kalau mode edit
         if mode == "edit":
             cfg = get_anon_config(channel_id)
             if cfg.get("template"):
@@ -420,22 +423,18 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
 
             embed = discord.Embed(
                 title="✅ Template Diupdate!",
-                description=(
-                    f"**Template baru:**\n"
-                    f"```\n{self.template_input.value}\n```"
-                ),
+                description=f"**Template baru:**\n```\n{self.template_input.value}\n```",
                 color=COLOR_DONE,
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# === SLASH COMMAND: /setanon ===
+# === /setanon ===
 @bot.tree.command(name="setanon", description="Set channel ini jadi announcement (auto-bump pesan template)")
 async def setanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
-            "🚫 Kamu butuh permission `Manage Messages`!",
-            ephemeral=True
+            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
         )
         return
 
@@ -454,13 +453,12 @@ async def setanon(interaction: discord.Interaction):
     await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="set"))
 
 
-# === SLASH COMMAND: /editanon ===
+# === /editanon ===
 @bot.tree.command(name="editanon", description="Edit template pesan announcement")
 async def editanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
-            "🚫 Kamu butuh permission `Manage Messages`!",
-            ephemeral=True
+            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
         )
         return
 
@@ -469,8 +467,7 @@ async def editanon(interaction: discord.Interaction):
 
     if str(ch_id) not in db:
         await interaction.response.send_message(
-            f"❌ Channel {interaction.channel.mention} belum di-set.\n"
-            f"Pakai `/setanon` dulu.",
+            f"❌ Channel {interaction.channel.mention} belum di-set.\nPakai `/setanon` dulu.",
             ephemeral=True
         )
         return
@@ -478,13 +475,12 @@ async def editanon(interaction: discord.Interaction):
     await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="edit"))
 
 
-# === SLASH COMMAND: /unsetanon ===
+# === /unsetanon ===
 @bot.tree.command(name="unsetanon", description="Hapus setting announcement channel")
 async def unsetanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message(
-            "🚫 Kamu butuh permission `Manage Messages`!",
-            ephemeral=True
+            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
         )
         return
 
@@ -509,7 +505,7 @@ async def unsetanon(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-# === SLASH COMMAND: /listanon ===
+# === /listanon ===
 @bot.tree.command(name="listanon", description="Lihat semua announcement channel di server ini")
 async def listanon(interaction: discord.Interaction):
     db = load_anon_db()
@@ -539,7 +535,7 @@ async def listanon(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# === SLASH COMMAND: /ping ===
+# === /ping ===
 @bot.tree.command(name="ping", description="Cek bot masih hidup")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(
@@ -547,30 +543,27 @@ async def ping(interaction: discord.Interaction):
     )
 
 
-# === EVENT: ON MESSAGE — AUTO BUMP ===
+# ============================================================
+# EVENT: ON MESSAGE — AUTO BUMP
+# ============================================================
 @bot.event
 async def on_message(message: discord.Message):
-    # Skip bot sendiri
     if message.author.bot:
         await bot.process_commands(message)
         return
 
-    # Skip DM
     if not message.guild:
         await bot.process_commands(message)
         return
 
-    # Cek apakah channel ini announcement channel
     if not is_anon_channel(message.channel.id):
         await bot.process_commands(message)
         return
 
-    # Skip pesan kosong (cuma attachment/sticker)
     if not message.content.strip():
         await bot.process_commands(message)
         return
 
-    # Cek cooldown
     ch_id = message.channel.id
     now = time.time()
     last = _last_bump.get(ch_id, 0)
@@ -579,7 +572,6 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Bump!
     cfg = get_anon_config(ch_id)
     template = cfg.get("template", "")
 
@@ -596,24 +588,45 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# === ON READY ===
+# ============================================================
+# ON READY — FORCE GUILD SYNC
+# ============================================================
 @bot.event
 async def on_ready():
+    print("=" * 60)
+    print(f"🤖 Bot online: {bot.user}")
+    print(f"🆔 Bot ID: {bot.user.id}")
+    print(f"🏠 Guilds: {[g.name for g in bot.guilds]}")
+    print(f"📁 QRIS tersedia: {list_qris_available()}")
+    print(f"📢 Anon channels: {list(load_anon_db().keys())}")
+
+    # Step 1: Sync GLOBAL (biar semua server bisa, tapi lambat)
     try:
         synced = await bot.tree.sync()
-        print(f"✅ Bot online: {bot.user}")
-        print(f"✅ Synced {len(synced)} slash commands")
-        print(f"💳 QRIS tersedia: {list_qris_available()}")
-        print(f"📢 Anon channels: {list(load_anon_db().keys())}")
-        if WHITELIST:
-            print(f"🔒 Whitelist aktif: {WHITELIST}")
-        else:
-            print("🌐 Whitelist OFF")
+        print(f"✅ Global sync: {len(synced)} commands")
+        for cmd in synced:
+            print(f"   - /{cmd.name}")
     except Exception as e:
-        print(f"❌ Sync error: {e}")
+        print(f"❌ Global sync error: {e}")
+
+    # Step 2: Sync ke SETIAP GUILD (INSTAN!)
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"✅ Guild sync '{guild.name}': {len(guild_synced)} commands")
+            for cmd in guild_synced:
+                print(f"   - /{cmd.name}")
+        except Exception as e:
+            print(f"⚠️ Gagal sync ke guild '{guild.name}': {e}")
+
+    print("=" * 60)
+    print("🎉 Bot READY! Coba ketik / di Discord.")
 
 
-# === RUN ===
+# ============================================================
+# RUN
+# ============================================================
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN tidak ditemukan di environment!")
