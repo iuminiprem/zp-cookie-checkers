@@ -1,4 +1,4 @@
-# v6 - guild sync for instant commands
+# v7 - delete previous bump + /status role feature
 import os
 import io
 import json
@@ -24,14 +24,12 @@ WHITELIST = [int(x.strip()) for x in WHITELIST_RAW.split(",") if x.strip().isdig
 POLL_INTERVAL = 2
 MAX_POLLS = 600
 
-# Folder QRIS
 QRIS_DIR = Path(__file__).parent / "qris"
 ANON_DB = Path(__file__).parent / "anon_channels.json"
 
-# Cooldown bump (detik)
 BUMP_COOLDOWN = 5
 
-# === KATEGORI ===
+# === KATEGORI COOKIE ===
 CATEGORIES = [
     {"key": "alive",        "name": "Alive",        "emoji": "🟢"},
     {"key": "dead",         "name": "Dead",         "emoji": "🔴"},
@@ -44,15 +42,18 @@ COLOR_CHECKING = 0x22d3ee
 COLOR_DONE     = 0x22c55e
 COLOR_ERROR    = 0xff4d6d
 COLOR_ANON     = 0x9b59b6
+COLOR_STATUS   = 0x5865f2
 
 # === BOT SETUP ===
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# State cooldown (in-memory)
-_last_bump = {}
+# State in-memory
+_last_bump = {}         # {channel_id: timestamp}
+_last_bump_msg = {}     # {channel_id: Message} buat dihapus pas bump baru
 
 
 # ============================================================
@@ -85,10 +86,7 @@ def build_check_embed(data, session_id):
     elif status == "error":
         color = COLOR_ERROR
 
-    embed = discord.Embed(
-        title=f"🍪 Cookie Checker — {status_text}",
-        color=color,
-    )
+    embed = discord.Embed(title=f"🍪 Cookie Checker — {status_text}", color=color)
     embed.add_field(
         name="📊 Progress",
         value=f"`{progress_bar(checked, total)}` **{checked}/{total}** ({pct}%)",
@@ -96,19 +94,11 @@ def build_check_embed(data, session_id):
     )
     for cat in CATEGORIES:
         count = data.get(f"{cat['key']}_count", 0)
-        embed.add_field(
-            name=f"{cat['emoji']} {cat['name']}",
-            value=f"**{count}**",
-            inline=True,
-        )
+        embed.add_field(name=f"{cat['emoji']} {cat['name']}", value=f"**{count}**", inline=True)
     embed.add_field(name="\u200b", value="\u200b", inline=True)
 
     if status == "pending" and data.get("queue_position"):
-        embed.add_field(
-            name="📌 Posisi Antrian",
-            value=f"**{data['queue_position']}**",
-            inline=False,
-        )
+        embed.add_field(name="📌 Posisi Antrian", value=f"**{data['queue_position']}**", inline=False)
     embed.set_footer(text=f"Session: {session_id}")
     return embed
 
@@ -400,10 +390,10 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
                 title="✅ Announcement Di-set!",
                 description=(
                     f"Channel {interaction.channel.mention} sekarang **aktif**.\n\n"
-                    f"**Template:**\n"
-                    f"```\n{self.template_input.value}\n```\n"
+                    f"**Template:**\n```\n{self.template_input.value}\n```\n"
                     f"Setiap ada chat, bot bakal **bump** template ini.\n"
-                    f"Cooldown: **{BUMP_COOLDOWN} detik**."
+                    f"Cooldown: **{BUMP_COOLDOWN} detik**.\n"
+                    f"Bump lama bakal dihapus otomatis."
                 ),
                 color=COLOR_ANON,
             )
@@ -413,8 +403,7 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
         elif self.mode == "edit":
             if ch_id not in db:
                 await interaction.response.send_message(
-                    "❌ Channel ini belum di-set. Pakai `/setanon` dulu.",
-                    ephemeral=True
+                    "❌ Channel ini belum di-set. Pakai `/setanon` dulu.", ephemeral=True
                 )
                 return
 
@@ -535,6 +524,43 @@ async def listanon(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ============================================================
+# SLASH COMMAND: /status (role-based)
+# ============================================================
+@bot.tree.command(name="status", description="Cek status worker (ON/OFF)")
+@app_commands.describe(user="User yang mau dicek statusnya (opsional)")
+async def status(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+
+    # Cek role WORKER / OWNER ON
+    # Ganti nama role di sini sesuai server kamu
+    ON_ROLES = ["WORKER ON", "OWNER ON", "WORKER", "OWNER"]
+
+    user_roles = [r.name.upper() for r in target.roles]
+    is_on = any(role.upper() in user_roles for role in ON_ROLES)
+
+    if is_on:
+        status_text = "🟢 **ON**"
+        status_desc = f"{target.mention} sedang **ON** — siap menerima order!"
+        color = COLOR_DONE
+    else:
+        status_text = "🔴 **OFF**"
+        status_desc = f"{target.mention} sedang **OFF** — lagi gak available."
+        color = COLOR_ERROR
+
+    embed = discord.Embed(
+        title=f"📊 Status — {target.display_name}",
+        description=status_desc,
+        color=color,
+    )
+    embed.add_field(name="Status", value=status_text, inline=True)
+    embed.add_field(name="User", value=target.mention, inline=True)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="Status berdasarkan role server")
+
+    await interaction.response.send_message(embed=embed)
+
+
 # === /ping ===
 @bot.tree.command(name="ping", description="Cek bot masih hidup")
 async def ping(interaction: discord.Interaction):
@@ -544,7 +570,7 @@ async def ping(interaction: discord.Interaction):
 
 
 # ============================================================
-# EVENT: ON MESSAGE — AUTO BUMP
+# EVENT: ON MESSAGE — AUTO BUMP (with auto-delete previous)
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -579,9 +605,19 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # === HAPUS BUMP SEBELUMNYA ===
+    old_msg = _last_bump_msg.get(ch_id)
+    if old_msg:
+        try:
+            await old_msg.delete()
+        except discord.HTTPException:
+            pass  # udah kehapus / gak ada
+
+    # === KIRIM BUMP BARU ===
     try:
-        await message.channel.send(template)
+        new_msg = await message.channel.send(template)
         _last_bump[ch_id] = now
+        _last_bump_msg[ch_id] = new_msg
     except discord.HTTPException as e:
         print(f"[anon bump error] {e}")
 
@@ -589,7 +625,7 @@ async def on_message(message: discord.Message):
 
 
 # ============================================================
-# ON READY — FORCE GUILD SYNC
+# ON READY
 # ============================================================
 @bot.event
 async def on_ready():
@@ -600,7 +636,7 @@ async def on_ready():
     print(f"📁 QRIS tersedia: {list_qris_available()}")
     print(f"📢 Anon channels: {list(load_anon_db().keys())}")
 
-    # Step 1: Sync GLOBAL (biar semua server bisa, tapi lambat)
+    # Sync global
     try:
         synced = await bot.tree.sync()
         print(f"✅ Global sync: {len(synced)} commands")
@@ -609,19 +645,17 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Global sync error: {e}")
 
-    # Step 2: Sync ke SETIAP GUILD (INSTAN!)
+    # Sync ke setiap guild (INSTAN)
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"✅ Guild sync '{guild.name}': {len(guild_synced)} commands")
-            for cmd in guild_synced:
-                print(f"   - /{cmd.name}")
         except Exception as e:
             print(f"⚠️ Gagal sync ke guild '{guild.name}': {e}")
 
     print("=" * 60)
-    print("🎉 Bot READY! Coba ketik / di Discord.")
+    print("🎉 Bot READY!")
 
 
 # ============================================================
