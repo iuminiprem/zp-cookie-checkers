@@ -32,7 +32,6 @@ STATUS_DB = Path(__file__).parent / "status_auto.json"
 BUMP_COOLDOWN = 5
 AUTO_STATUS_INTERVAL = 60
 
-# WIB timezone
 WIB = timezone(timedelta(hours=7))
 
 # === KATEGORI ===
@@ -65,7 +64,6 @@ _last_bump_msg = {}
 # HELPERS
 # ============================================================
 def now_wib() -> str:
-    """Waktu sekarang dalam WIB (HH:MM:SS)."""
     return datetime.now(WIB).strftime("%H:%M:%S")
 
 
@@ -141,7 +139,6 @@ def list_qris_available():
 
 
 def check_user_status(member: discord.Member, role_name: str) -> bool:
-    """Return True kalau user punya role tertentu (case-insensitive)."""
     if not member or not hasattr(member, "roles"):
         return False
     role_upper = role_name.upper().strip()
@@ -249,7 +246,6 @@ class StatusAutoModal(discord.ui.Modal, title="Setup Status Auto"):
         ch_id = str(self.channel_id)
         db = load_status_db()
 
-        # Cek kalau udah ada
         if ch_id in db:
             await interaction.response.send_message(
                 f"⚠️ Channel ini udah di-set!\n"
@@ -258,7 +254,6 @@ class StatusAutoModal(discord.ui.Modal, title="Setup Status Auto"):
             )
             return
 
-        # Init entry baru
         db[ch_id] = {
             "channel_id": ch_id,
             "guild_id": str(self.guild_id),
@@ -271,7 +266,6 @@ class StatusAutoModal(discord.ui.Modal, title="Setup Status Auto"):
         }
         save_status_db(db)
 
-        # Kirim pesan pertama
         channel = interaction.channel
         embed = build_status_embed([], db[ch_id]["title"], db[ch_id]["role_name"])
 
@@ -579,7 +573,6 @@ async def statusautouser(
     db[ch_id]["user_ids"] = user_ids
     save_status_db(db)
 
-    # Update pesan embed langsung
     await refresh_status_message(ch_id)
 
     await interaction.response.send_message(msg_text, ephemeral=True)
@@ -606,7 +599,6 @@ async def statusautostop(interaction: discord.Interaction):
         )
         return
 
-    # Hapus pesan embed
     msg_id = db[ch_id].get("message_id")
     if msg_id:
         try:
@@ -865,7 +857,7 @@ async def on_message(message: discord.Message):
 
 
 # ============================================================
-# REFRESH HELPER
+# REFRESH STATUS MESSAGE
 # ============================================================
 async def refresh_status_message(ch_id: str):
     """Update pesan status embed di channel."""
@@ -886,4 +878,82 @@ async def refresh_status_message(ch_id: str):
         except Exception:
             members.append(None)
 
-    embed = build_status_embed(members,
+    embed = build_status_embed(members, cfg.get("title", "Status"), cfg.get("role_name", "WORKER"))
+
+    msg_id = cfg.get("message_id")
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.edit(embed=embed)
+            return
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"[status refresh error] {e}")
+            return
+
+    try:
+        new_msg = await channel.send(embed=embed)
+        db[ch_id]["message_id"] = str(new_msg.id)
+        save_status_db(db)
+    except discord.HTTPException as e:
+        print(f"[status send error] {e}")
+
+
+# ============================================================
+# TASK: AUTO-REFRESH STATUS
+# ============================================================
+@tasks.loop(seconds=AUTO_STATUS_INTERVAL)
+async def auto_status_refresh():
+    db = load_status_db()
+    if not db:
+        return
+    for ch_id in list(db.keys()):
+        try:
+            await refresh_status_message(ch_id)
+        except Exception as e:
+            print(f"[auto_status error] {e}")
+
+
+# ============================================================
+# ON READY
+# ============================================================
+@bot.event
+async def on_ready():
+    print("=" * 60)
+    print(f"🤖 Bot online: {bot.user}")
+    print(f"🆔 Bot ID: {bot.user.id}")
+    print(f"🏠 Guilds: {[g.name for g in bot.guilds]}")
+    print(f"📁 QRIS tersedia: {list_qris_available()}")
+    print(f"📢 Anon channels: {list(load_anon_db().keys())}")
+    print(f"📊 Auto-status channels: {list(load_status_db().keys())}")
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Global sync: {len(synced)} commands")
+    except Exception as e:
+        print(f"❌ Global sync error: {e}")
+
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"✅ Guild sync '{guild.name}': {len(guild_synced)} commands")
+        except Exception as e:
+            print(f"⚠️ Gagal sync ke guild '{guild.name}': {e}")
+
+    if not auto_status_refresh.is_running():
+        auto_status_refresh.start()
+        print("🔄 Auto-status refresh task STARTED")
+
+    print("=" * 60)
+    print("🎉 Bot READY!")
+
+
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        raise SystemExit("❌ DISCORD_TOKEN tidak ditemukan di environment!")
+    bot.run(DISCORD_TOKEN)
