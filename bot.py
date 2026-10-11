@@ -1,4 +1,4 @@
-# v10 - simple status auto
+# v11 - status based (online/idle/dnd = ON, offline = OFF)
 import os
 import io
 import json
@@ -34,7 +34,6 @@ AUTO_STATUS_INTERVAL = 60
 
 WIB = timezone(timedelta(hours=7))
 
-# === KATEGORI ===
 CATEGORIES = [
     {"key": "alive",        "name": "Alive",        "emoji": "🟢"},
     {"key": "dead",         "name": "Dead",         "emoji": "🔴"},
@@ -54,6 +53,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.presences = True  # WAJIB buat baca status
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 _last_bump = {}
@@ -138,12 +138,41 @@ def list_qris_available():
     return sorted(names)
 
 
-def check_user_status(member: discord.Member, role_name: str) -> bool:
-    if not member or not hasattr(member, "roles"):
+def check_user_status(member: discord.Member) -> bool:
+    """Return True kalau user status online/idle/dnd, False kalau offline."""
+    if not member:
         return False
-    role_upper = role_name.upper().strip()
-    user_roles = [r.name.upper().strip() for r in member.roles]
-    return role_upper in user_roles
+    return member.status != discord.Status.offline
+
+
+def get_status_emoji(member: discord.Member) -> str:
+    """Emoji sesuai status user."""
+    if not member:
+        return "⚫"
+    status = member.status
+    if status == discord.Status.online:
+        return "🟢"
+    elif status == discord.Status.idle:
+        return "🟡"
+    elif status == discord.Status.dnd:
+        return "🔴"
+    else:
+        return "⚫"
+
+
+def get_status_text(member: discord.Member) -> str:
+    """Teks status user."""
+    if not member:
+        return "Offline"
+    status = member.status
+    if status == discord.Status.online:
+        return "ON"
+    elif status == discord.Status.idle:
+        return "ON"
+    elif status == discord.Status.dnd:
+        return "ON"
+    else:
+        return "OFF"
 
 
 # ============================================================
@@ -199,7 +228,7 @@ def save_status_db(data: dict):
 # ============================================================
 # BUILD STATUS EMBED
 # ============================================================
-def build_status_embed(members: list, title: str, role_name: str) -> discord.Embed:
+def build_status_embed(members: list, title: str) -> discord.Embed:
     embed = discord.Embed(title=title, color=COLOR_STATUS)
 
     if not members:
@@ -208,12 +237,11 @@ def build_status_embed(members: list, title: str, role_name: str) -> discord.Emb
         lines = []
         for m in members:
             if m is None:
-                lines.append("❔ *User tidak ditemukan*")
+                lines.append("⚫ *User tidak ditemukan*")
                 continue
-            is_on = check_user_status(m, role_name)
-            indicator = "🟢" if is_on else "🔴"
-            status_text = "ON" if is_on else "OFF"
-            lines.append(f"{indicator} **{m.display_name}** — `{status_text}`")
+            emoji = get_status_emoji(m)
+            status_text = get_status_text(m)
+            lines.append(f"{emoji} **{m.display_name}** — `{status_text}`")
         embed.description = "\n\n".join(lines)
 
     embed.set_footer(text=f"🔄 Auto-refresh tiap 1 menit • Update: {now_wib()} WIB")
@@ -411,12 +439,11 @@ async def pay(interaction: discord.Interaction, target: str):
 
 
 # ============================================================
-# SLASH COMMAND: /statusauto (SIMPLE, NO MODAL)
+# SLASH COMMAND: /statusauto (SIMPLE, NO ROLE, STATUS-BASED)
 # ============================================================
-@bot.tree.command(name="statusauto", description="Setup auto-status di channel ini (tiap 1 menit refresh)")
+@bot.tree.command(name="statusauto", description="Setup auto-status di channel ini (detect dari status Discord)")
 @app_commands.describe(
-    role="Role yang dianggap ON (pilih dari list)",
-    title="Judul embed (contoh: WORKER SOLVER YANG ONLINE)",
+    title="Judul embed (contoh: WORKER YANG ONLINE)",
     user1="User pertama",
     user2="User kedua (opsional)",
     user3="User ketiga (opsional)",
@@ -430,7 +457,6 @@ async def pay(interaction: discord.Interaction, target: str):
 )
 async def statusauto(
     interaction: discord.Interaction,
-    role: discord.Role,
     title: str,
     user1: discord.Member,
     user2: discord.Member = None,
@@ -462,16 +488,13 @@ async def statusauto(
 
     members = [u for u in [user1, user2, user3, user4, user5, user6, user7, user8, user9, user10] if u is not None]
     user_ids = [str(u.id) for u in members]
-    role_name = role.name
 
     await interaction.response.defer(thinking=True)
 
-    # Simpan config
     db[ch_id] = {
         "channel_id": ch_id,
         "guild_id": str(interaction.guild_id),
         "title": title,
-        "role_name": role_name,
         "user_ids": user_ids,
         "message_id": None,
         "set_by": str(interaction.user.id),
@@ -479,8 +502,7 @@ async def statusauto(
     }
     save_status_db(db)
 
-    # Kirim pesan pertama
-    embed = build_status_embed(members, title, role_name)
+    embed = build_status_embed(members, title)
     try:
         msg = await interaction.channel.send(embed=embed)
         db[ch_id]["message_id"] = str(msg.id)
@@ -494,9 +516,11 @@ async def statusauto(
         description=(
             f"**Channel:** {interaction.channel.mention}\n"
             f"**Judul:** `{title}`\n"
-            f"**Role ON:** {role.mention}\n"
             f"**Users:** {len(user_ids)} orang\n"
             f"**Auto-refresh:** Tiap 1 menit\n\n"
+            f"Status diambil dari **status Discord** user:\n"
+            f"🟢 Online • 🟡 Idle • 🔴 DND → **ON**\n"
+            f"⚫ Offline → **OFF**\n\n"
             f"Stop pakai `/statusautostop` di channel ini."
         ),
         color=COLOR_DONE,
@@ -504,9 +528,6 @@ async def statusauto(
     await interaction.followup.send(embed=embed_reply, ephemeral=True)
 
 
-# ============================================================
-# SLASH COMMAND: /statusautoadd
-# ============================================================
 @bot.tree.command(name="statusautoadd", description="Tambah user ke auto-status")
 @app_commands.describe(user="User yang mau ditambah")
 async def statusautoadd(interaction: discord.Interaction, user: discord.Member):
@@ -519,7 +540,7 @@ async def statusautoadd(interaction: discord.Interaction, user: discord.Member):
 
     if ch_id not in db:
         await interaction.response.send_message(
-            "❌ Channel ini belum di-set auto-status. Pakai `/statusauto` dulu.", ephemeral=True
+            "❌ Channel ini belum di-set auto-status.", ephemeral=True
         )
         return
 
@@ -542,9 +563,6 @@ async def statusautoadd(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(f"✅ {user.mention} ditambah!", ephemeral=True)
 
 
-# ============================================================
-# SLASH COMMAND: /statusautoremove
-# ============================================================
 @bot.tree.command(name="statusautoremove", description="Hapus user dari auto-status")
 @app_commands.describe(user="User yang mau dihapus")
 async def statusautoremove(interaction: discord.Interaction, user: discord.Member):
@@ -574,9 +592,6 @@ async def statusautoremove(interaction: discord.Interaction, user: discord.Membe
     await interaction.response.send_message(f"🗑️ {user.mention} dihapus!", ephemeral=True)
 
 
-# ============================================================
-# SLASH COMMAND: /statusautostop
-# ============================================================
 @bot.tree.command(name="statusautostop", description="Stop auto-status di channel ini")
 async def statusautostop(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
@@ -587,9 +602,7 @@ async def statusautostop(interaction: discord.Interaction):
     db = load_status_db()
 
     if ch_id not in db:
-        await interaction.response.send_message(
-            "❌ Channel ini bukan auto-status channel!", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Channel ini bukan auto-status channel!", ephemeral=True)
         return
 
     msg_id = db[ch_id].get("message_id")
@@ -608,9 +621,6 @@ async def statusautostop(interaction: discord.Interaction):
     )
 
 
-# ============================================================
-# SLASH COMMAND: /statusautolist
-# ============================================================
 @bot.tree.command(name="statusautolist", description="Lihat semua auto-status channel")
 async def statusautolist(interaction: discord.Interaction):
     db = load_status_db()
@@ -621,45 +631,13 @@ async def statusautolist(interaction: discord.Interaction):
         if cfg.get("guild_id") == guild_id:
             ch = interaction.guild.get_channel(int(ch_id))
             if ch:
-                lines.append(
-                    f"• {ch.mention} — `{cfg.get('title', '?')}` "
-                    f"| Role: `{cfg.get('role_name', '?')}` "
-                    f"| {len(cfg.get('user_ids', []))} user"
-                )
+                lines.append(f"• {ch.mention} — `{cfg.get('title', '?')}` | {len(cfg.get('user_ids', []))} user")
 
     if not lines:
         await interaction.response.send_message("📭 Belum ada.", ephemeral=True)
         return
 
     embed = discord.Embed(title="📊 Auto-Status Channels", description="\n".join(lines), color=COLOR_STATUS)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ============================================================
-# SLASH COMMAND: /debugstatus
-# ============================================================
-@bot.tree.command(name="debugstatus", description="Debug: cek role user")
-@app_commands.describe(user="User yang mau dicek")
-async def debugstatus(interaction: discord.Interaction, user: discord.Member = None):
-    target = user or interaction.user
-    ch_id = str(interaction.channel_id)
-    db = load_status_db()
-
-    role_name = db.get(ch_id, {}).get("role_name", "WORKER")
-    roles = [r.name for r in target.roles]
-    has_role = check_user_status(target, role_name)
-
-    embed = discord.Embed(title=f"🔍 Debug — {target.display_name}", color=COLOR_STATUS)
-    embed.add_field(
-        name="Semua Role",
-        value="\n".join(f"• `{r}`" for r in roles) or "*kosong*",
-        inline=False,
-    )
-    embed.add_field(
-        name=f"Cek Role: `{role_name}`",
-        value="✅ **PUNYA**" if has_role else "❌ **GAK PUNYA**",
-        inline=False,
-    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -838,12 +816,14 @@ async def refresh_status_message(ch_id: str):
     members = []
     for uid in cfg.get("user_ids", []):
         try:
-            m = await channel.guild.fetch_member(int(uid))
+            m = channel.guild.get_member(int(uid))
+            if m is None:
+                m = await channel.guild.fetch_member(int(uid))
             members.append(m)
         except Exception:
             members.append(None)
 
-    embed = build_status_embed(members, cfg.get("title", "Status"), cfg.get("role_name", "WORKER"))
+    embed = build_status_embed(members, cfg.get("title", "Status"))
 
     msg_id = cfg.get("message_id")
     if msg_id:
@@ -878,6 +858,25 @@ async def auto_status_refresh():
             await refresh_status_message(ch_id)
         except Exception as e:
             print(f"[auto_status error] {e}")
+
+
+# ============================================================
+# EVENT: PRESENCE UPDATE — INSTANT REFRESH
+# ============================================================
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    """Kalau ada user ganti status, langsung refresh."""
+    db = load_status_db()
+    if not db:
+        return
+
+    uid = str(after.id)
+    for ch_id, cfg in db.items():
+        if uid in cfg.get("user_ids", []):
+            try:
+                await refresh_status_message(ch_id)
+            except Exception as e:
+                print(f"[presence refresh error] {e}")
 
 
 # ============================================================
