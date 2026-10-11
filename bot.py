@@ -1,4 +1,4 @@
-# v11 - status based (online/idle/dnd = ON, offline = OFF)
+# v12 - reaction role (button) + all features
 import os
 import io
 import json
@@ -28,6 +28,7 @@ MAX_POLLS = 600
 QRIS_DIR = Path(__file__).parent / "qris"
 ANON_DB = Path(__file__).parent / "anon_channels.json"
 STATUS_DB = Path(__file__).parent / "status_auto.json"
+GETROLE_DB = Path(__file__).parent / "getrole.json"
 
 BUMP_COOLDOWN = 5
 AUTO_STATUS_INTERVAL = 60
@@ -47,13 +48,22 @@ COLOR_DONE     = 0x22c55e
 COLOR_ERROR    = 0xff4d6d
 COLOR_ANON     = 0x9b59b6
 COLOR_STATUS   = 0x5865f2
+COLOR_GETROLE  = 0x9b59b6
+
+# Button styles rotation
+BUTTON_STYLES = [
+    discord.ButtonStyle.primary,    # Blue
+    discord.ButtonStyle.success,    # Green
+    discord.ButtonStyle.danger,     # Red
+    discord.ButtonStyle.secondary,  # Gray
+]
 
 # === BOT SETUP ===
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
-intents.presences = True  # WAJIB buat baca status
+intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 _last_bump = {}
@@ -139,14 +149,12 @@ def list_qris_available():
 
 
 def check_user_status(member: discord.Member) -> bool:
-    """Return True kalau user status online/idle/dnd, False kalau offline."""
     if not member:
         return False
     return member.status != discord.Status.offline
 
 
 def get_status_emoji(member: discord.Member) -> str:
-    """Emoji sesuai status user."""
     if not member:
         return "⚫"
     status = member.status
@@ -156,23 +164,13 @@ def get_status_emoji(member: discord.Member) -> str:
         return "🟡"
     elif status == discord.Status.dnd:
         return "🔴"
-    else:
-        return "⚫"
+    return "⚫"
 
 
 def get_status_text(member: discord.Member) -> str:
-    """Teks status user."""
     if not member:
-        return "Offline"
-    status = member.status
-    if status == discord.Status.online:
-        return "ON"
-    elif status == discord.Status.idle:
-        return "ON"
-    elif status == discord.Status.dnd:
-        return "ON"
-    else:
         return "OFF"
+    return "ON" if member.status != discord.Status.offline else "OFF"
 
 
 # ============================================================
@@ -226,6 +224,27 @@ def save_status_db(data: dict):
 
 
 # ============================================================
+# GETROLE DB
+# ============================================================
+def load_getrole_db() -> dict:
+    if not GETROLE_DB.exists():
+        return {}
+    try:
+        with open(GETROLE_DB, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_getrole_db(data: dict):
+    try:
+        with open(GETROLE_DB, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Gagal save getrole db: {e}")
+
+
+# ============================================================
 # BUILD STATUS EMBED
 # ============================================================
 def build_status_embed(members: list, title: str) -> discord.Embed:
@@ -246,6 +265,88 @@ def build_status_embed(members: list, title: str) -> discord.Embed:
 
     embed.set_footer(text=f"🔄 Auto-refresh tiap 1 menit • Update: {now_wib()} WIB")
     return embed
+
+
+# ============================================================
+# GETROLE VIEW (Persistent)
+# ============================================================
+class GetRoleButton(discord.ui.Button):
+    def __init__(self, role_id: int, role_name: str, emoji: str, style: discord.ButtonStyle, row: int):
+        super().__init__(
+            label=role_name[:80],  # Max 80 char
+            emoji=emoji,
+            style=style,
+            custom_id=f"getrole_{role_id}",
+            row=row,
+        )
+        self.role_id = role_id
+
+    async def callback(self, interaction: discord.Interaction):
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            await interaction.response.send_message(
+                "❌ Role udah gak ada di server.", ephemeral=True
+            )
+            return
+
+        member = interaction.user
+
+        # Cek apakah user udah punya role ini
+        if role in member.roles:
+            # Hapus role
+            try:
+                await member.remove_roles(role, reason="GetRole toggle")
+                await interaction.response.send_message(
+                    f"🗑️ Role **{role.name}** dihapus dari kamu.",
+                    ephemeral=True,
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ Bot gak punya izin buat hapus role ini.",
+                    ephemeral=True,
+                )
+        else:
+            # Kasih role
+            try:
+                await member.add_roles(role, reason="GetRole toggle")
+                await interaction.response.send_message(
+                    f"✅ Role **{role.name}** dikasih ke kamu!",
+                    ephemeral=True,
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ Bot gak punya izin buat kasih role ini.",
+                    ephemeral=True,
+                )
+
+
+class GetRoleView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)  # Persistent
+
+        # Load roles dari DB
+        db = load_getrole_db()
+        cfg = db.get(str(guild_id), {})
+        roles = cfg.get("roles", [])
+
+        # Batas 25 role (5x5 grid)
+        roles = roles[:25]
+
+        # Bikin button per role
+        for i, r in enumerate(roles):
+            role_id = int(r["role_id"])
+            role_name = r.get("role_name", "Role")
+            emoji = r.get("emoji", "🔹")
+            style = BUTTON_STYLES[i % len(BUTTON_STYLES)]
+            row = i // 5  # Max 5 button per row
+
+            self.add_item(GetRoleButton(
+                role_id=role_id,
+                role_name=role_name,
+                emoji=emoji,
+                style=style,
+                row=row,
+            ))
 
 
 # ============================================================
@@ -439,9 +540,9 @@ async def pay(interaction: discord.Interaction, target: str):
 
 
 # ============================================================
-# SLASH COMMAND: /statusauto (SIMPLE, NO ROLE, STATUS-BASED)
+# SLASH COMMAND: /statusauto
 # ============================================================
-@bot.tree.command(name="statusauto", description="Setup auto-status di channel ini (detect dari status Discord)")
+@bot.tree.command(name="statusauto", description="Setup auto-status di channel ini")
 @app_commands.describe(
     title="Judul embed (contoh: WORKER YANG ONLINE)",
     user1="User pertama",
@@ -449,11 +550,6 @@ async def pay(interaction: discord.Interaction, target: str):
     user3="User ketiga (opsional)",
     user4="User keempat (opsional)",
     user5="User kelima (opsional)",
-    user6="User keenam (opsional)",
-    user7="User ketujuh (opsional)",
-    user8="User kedelapan (opsional)",
-    user9="User kesembilan (opsional)",
-    user10="User kesepuluh (opsional)",
 )
 async def statusauto(
     interaction: discord.Interaction,
@@ -463,16 +559,9 @@ async def statusauto(
     user3: discord.Member = None,
     user4: discord.Member = None,
     user5: discord.Member = None,
-    user6: discord.Member = None,
-    user7: discord.Member = None,
-    user8: discord.Member = None,
-    user9: discord.Member = None,
-    user10: discord.Member = None,
 ):
     if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message(
-            "🚫 Kamu butuh permission `Manage Messages`!", ephemeral=True
-        )
+        await interaction.response.send_message("🚫 Butuh `Manage Messages`!", ephemeral=True)
         return
 
     ch_id = str(interaction.channel_id)
@@ -480,13 +569,11 @@ async def statusauto(
 
     if ch_id in db:
         await interaction.response.send_message(
-            f"⚠️ Channel {interaction.channel.mention} udah di-set!\n"
-            f"Stop dulu pakai `/statusautostop`.",
-            ephemeral=True
+            f"⚠️ Channel udah di-set! Stop dulu pakai `/statusautostop`.", ephemeral=True
         )
         return
 
-    members = [u for u in [user1, user2, user3, user4, user5, user6, user7, user8, user9, user10] if u is not None]
+    members = [u for u in [user1, user2, user3, user4, user5] if u is not None]
     user_ids = [str(u.id) for u in members]
 
     await interaction.response.defer(thinking=True)
@@ -497,8 +584,6 @@ async def statusauto(
         "title": title,
         "user_ids": user_ids,
         "message_id": None,
-        "set_by": str(interaction.user.id),
-        "set_at": str(discord.utils.utcnow()),
     }
     save_status_db(db)
 
@@ -511,83 +596,52 @@ async def statusauto(
         await interaction.followup.send(f"❌ Gagal kirim: `{e}`")
         return
 
-    embed_reply = discord.Embed(
-        title="✅ Auto-Status Di-set!",
-        description=(
-            f"**Channel:** {interaction.channel.mention}\n"
-            f"**Judul:** `{title}`\n"
-            f"**Users:** {len(user_ids)} orang\n"
-            f"**Auto-refresh:** Tiap 1 menit\n\n"
-            f"Status diambil dari **status Discord** user:\n"
-            f"🟢 Online • 🟡 Idle • 🔴 DND → **ON**\n"
-            f"⚫ Offline → **OFF**\n\n"
-            f"Stop pakai `/statusautostop` di channel ini."
-        ),
-        color=COLOR_DONE,
+    await interaction.followup.send(
+        f"✅ Auto-status di-set di {interaction.channel.mention}!\n"
+        f"Tambah/hapus user: `/statusautoadd` / `/statusautoremove`",
+        ephemeral=True,
     )
-    await interaction.followup.send(embed=embed_reply, ephemeral=True)
 
 
 @bot.tree.command(name="statusautoadd", description="Tambah user ke auto-status")
-@app_commands.describe(user="User yang mau ditambah")
 async def statusautoadd(interaction: discord.Interaction, user: discord.Member):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("🚫 Butuh `Manage Messages`!", ephemeral=True)
         return
-
     ch_id = str(interaction.channel_id)
     db = load_status_db()
-
     if ch_id not in db:
-        await interaction.response.send_message(
-            "❌ Channel ini belum di-set auto-status.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Channel belum di-set.", ephemeral=True)
         return
-
-    user_ids = db[ch_id].get("user_ids", [])
     uid = str(user.id)
-
-    if uid in user_ids:
+    if uid in db[ch_id]["user_ids"]:
         await interaction.response.send_message(f"⚠️ {user.mention} udah ada!", ephemeral=True)
         return
-
-    if len(user_ids) >= 20:
+    if len(db[ch_id]["user_ids"]) >= 20:
         await interaction.response.send_message("⚠️ Max 20 user!", ephemeral=True)
         return
-
-    user_ids.append(uid)
-    db[ch_id]["user_ids"] = user_ids
+    db[ch_id]["user_ids"].append(uid)
     save_status_db(db)
-
     await refresh_status_message(ch_id)
     await interaction.response.send_message(f"✅ {user.mention} ditambah!", ephemeral=True)
 
 
 @bot.tree.command(name="statusautoremove", description="Hapus user dari auto-status")
-@app_commands.describe(user="User yang mau dihapus")
 async def statusautoremove(interaction: discord.Interaction, user: discord.Member):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("🚫 Butuh `Manage Messages`!", ephemeral=True)
         return
-
     ch_id = str(interaction.channel_id)
     db = load_status_db()
-
     if ch_id not in db:
-        await interaction.response.send_message("❌ Channel ini belum di-set.", ephemeral=True)
+        await interaction.response.send_message("❌ Channel belum di-set.", ephemeral=True)
         return
-
-    user_ids = db[ch_id].get("user_ids", [])
     uid = str(user.id)
-
-    if uid not in user_ids:
-        await interaction.response.send_message(f"⚠️ {user.mention} gak ada di list!", ephemeral=True)
+    if uid not in db[ch_id]["user_ids"]:
+        await interaction.response.send_message(f"⚠️ {user.mention} gak ada!", ephemeral=True)
         return
-
-    user_ids.remove(uid)
-    db[ch_id]["user_ids"] = user_ids
+    db[ch_id]["user_ids"].remove(uid)
     save_status_db(db)
-
     await refresh_status_message(ch_id)
     await interaction.response.send_message(f"🗑️ {user.mention} dihapus!", ephemeral=True)
 
@@ -597,14 +651,11 @@ async def statusautostop(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("🚫 Butuh `Manage Messages`!", ephemeral=True)
         return
-
     ch_id = str(interaction.channel_id)
     db = load_status_db()
-
     if ch_id not in db:
-        await interaction.response.send_message("❌ Channel ini bukan auto-status channel!", ephemeral=True)
+        await interaction.response.send_message("❌ Bukan auto-status channel!", ephemeral=True)
         return
-
     msg_id = db[ch_id].get("message_id")
     if msg_id:
         try:
@@ -612,33 +663,214 @@ async def statusautostop(interaction: discord.Interaction):
             await msg.delete()
         except Exception:
             pass
-
     del db[ch_id]
     save_status_db(db)
+    await interaction.response.send_message(f"🗑️ Auto-status dimatiin.", ephemeral=True)
+
+
+# ============================================================
+# SLASH COMMAND: /getrole (reaction role)
+# ============================================================
+getrole_group = app_commands.Group(name="getrole", description="Setup reaction role")
+
+
+@getrole_group.command(name="add", description="Tambah role ke panel")
+@app_commands.describe(
+    role="Role yang mau dikasih",
+    emoji="Emoji buat tombol (opsional)",
+)
+async def getrole_add(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    emoji: str = "🔹",
+):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("🚫 Butuh `Manage Roles`!", ephemeral=True)
+        return
+
+    # Cek bot bisa kasih role ini
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ Role ini lebih tinggi dari role bot. Pindahin role bot ke atas dulu.",
+            ephemeral=True,
+        )
+        return
+
+    if role.is_default():
+        await interaction.response.send_message("❌ Gak bisa pakai role @everyone!", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    db = load_getrole_db()
+
+    if guild_id not in db:
+        db[guild_id] = {"roles": []}
+
+    # Cek udah ada?
+    for r in db[guild_id]["roles"]:
+        if r["role_id"] == str(role.id):
+            await interaction.response.send_message(
+                f"⚠️ Role {role.mention} udah ada di panel!", ephemeral=True
+            )
+            return
+
+    # Cek limit
+    if len(db[guild_id]["roles"]) >= 25:
+        await interaction.response.send_message(
+            "⚠️ Max 25 role per panel!", ephemeral=True
+        )
+        return
+
+    # Tambah
+    db[guild_id]["roles"].append({
+        "role_id": str(role.id),
+        "role_name": role.name,
+        "emoji": emoji,
+    })
+    save_getrole_db(db)
 
     await interaction.response.send_message(
-        f"🗑️ Auto-status di {interaction.channel.mention} dimatiin.", ephemeral=True
+        f"✅ Role {role.mention} + {emoji} ditambah!\n"
+        f"Total: {len(db[guild_id]['roles'])} role\n\n"
+        f"Kirim panel pakai `/getrole send`",
+        ephemeral=True,
     )
 
 
-@bot.tree.command(name="statusautolist", description="Lihat semua auto-status channel")
-async def statusautolist(interaction: discord.Interaction):
-    db = load_status_db()
-    guild_id = str(interaction.guild_id)
-
-    lines = []
-    for ch_id, cfg in db.items():
-        if cfg.get("guild_id") == guild_id:
-            ch = interaction.guild.get_channel(int(ch_id))
-            if ch:
-                lines.append(f"• {ch.mention} — `{cfg.get('title', '?')}` | {len(cfg.get('user_ids', []))} user")
-
-    if not lines:
-        await interaction.response.send_message("📭 Belum ada.", ephemeral=True)
+@getrole_group.command(name="remove", description="Hapus role dari panel")
+@app_commands.describe(role="Role yang mau dihapus")
+async def getrole_remove(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("🚫 Butuh `Manage Roles`!", ephemeral=True)
         return
 
-    embed = discord.Embed(title="📊 Auto-Status Channels", description="\n".join(lines), color=COLOR_STATUS)
+    guild_id = str(interaction.guild_id)
+    db = load_getrole_db()
+
+    if guild_id not in db:
+        await interaction.response.send_message("❌ Belum ada role di panel!", ephemeral=True)
+        return
+
+    original = len(db[guild_id]["roles"])
+    db[guild_id]["roles"] = [
+        r for r in db[guild_id]["roles"] if r["role_id"] != str(role.id)
+    ]
+
+    if len(db[guild_id]["roles"]) == original:
+        await interaction.response.send_message(
+            f"⚠️ Role {role.mention} gak ada di panel!", ephemeral=True
+        )
+        return
+
+    save_getrole_db(db)
+    await interaction.response.send_message(
+        f"🗑️ Role {role.mention} dihapus dari panel!", ephemeral=True
+    )
+
+
+@getrole_group.command(name="list", description="Lihat semua role di panel")
+async def getrole_list(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    db = load_getrole_db()
+    roles = db.get(guild_id, {}).get("roles", [])
+
+    if not roles:
+        await interaction.response.send_message(
+            "📭 Belum ada role di panel. Tambah pakai `/getrole add`.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for i, r in enumerate(roles, 1):
+        lines.append(f"{i}. {r['emoji']} → <@&{r['role_id']}>")
+
+    embed = discord.Embed(
+        title=f"📋 Get Role List ({len(roles)} role)",
+        description="\n".join(lines),
+        color=COLOR_GETROLE,
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@getrole_group.command(name="send", description="Kirim panel get-role ke channel")
+@app_commands.describe(
+    channel="Channel tujuan",
+    title="Judul panel (opsional)",
+    description="Deskripsi panel (opsional)",
+)
+async def getrole_send(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None,
+    title: str = "🎭 Ambil Role Kamu!",
+    description: str = "Klik tombol di bawah untuk ambil / lepas role.\nKlik lagi untuk lepas role.",
+):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("🚫 Butuh `Manage Roles`!", ephemeral=True)
+        return
+
+    target = channel or interaction.channel
+    guild_id = str(interaction.guild_id)
+    db = load_getrole_db()
+    roles = db.get(guild_id, {}).get("roles", [])
+
+    if not roles:
+        await interaction.response.send_message(
+            "❌ Belum ada role. Tambah dulu pakai `/getrole add`.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=COLOR_GETROLE,
+    )
+
+    # List role di deskripsi
+    role_lines = "\n".join(f"{r['emoji']} **{r['role_name']}**" for r in roles)
+    embed.add_field(name="📋 Role Tersedia", value=role_lines, inline=False)
+    embed.set_footer(text="Powered by Cek Zzz Solve")
+
+    view = GetRoleView(interaction.guild_id)
+
+    try:
+        msg = await target.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Bot gak punya izin kirim ke {target.mention}!", ephemeral=True
+        )
+        return
+
+    # Simpan message_id
+    db.setdefault(guild_id, {})["panel_message_id"] = str(msg.id)
+    db[guild_id]["panel_channel_id"] = str(target.id)
+    save_getrole_db(db)
+
+    await interaction.response.send_message(
+        f"✅ Panel terkirim di {target.mention}! ({len(roles)} role)",
+        ephemeral=True,
+    )
+
+
+@getrole_group.command(name="reset", description="Hapus semua role dari panel")
+async def getrole_reset(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("🚫 Butuh `Manage Roles`!", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    db = load_getrole_db()
+
+    if guild_id in db:
+        del db[guild_id]
+        save_getrole_db(db)
+
+    await interaction.response.send_message("🗑️ Panel di-reset!", ephemeral=True)
+
+
+# Daftar group ke bot
+bot.tree.add_command(getrole_group)
 
 
 # ============================================================
@@ -670,17 +902,10 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
             db[ch_id] = {
                 "channel_id": ch_id,
                 "guild_id": str(interaction.guild_id),
-                "set_by": str(interaction.user.id),
-                "set_at": str(discord.utils.utcnow()),
                 "template": self.template_input.value,
             }
             save_anon_db(db)
-            embed = discord.Embed(
-                title="✅ Announcement Di-set!",
-                description=f"Channel {interaction.channel.mention} **aktif**.",
-                color=COLOR_ANON,
-            )
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message("✅ Announcement di-set!", ephemeral=True)
         elif self.mode == "edit":
             if ch_id not in db:
                 await interaction.response.send_message("❌ Belum di-set.", ephemeral=True)
@@ -690,16 +915,15 @@ class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
             await interaction.response.send_message("✅ Template diupdate!", ephemeral=True)
 
 
-@bot.tree.command(name="setanon", description="Set channel ini jadi announcement (auto-bump)")
+@bot.tree.command(name="setanon", description="Set channel jadi announcement (auto-bump)")
 async def setanon(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("🚫 Butuh `Manage Messages`!", ephemeral=True)
         return
-    ch_id = interaction.channel_id
-    if str(ch_id) in load_anon_db():
-        await interaction.response.send_message(f"⚠️ Udah di-set!", ephemeral=True)
+    if str(interaction.channel_id) in load_anon_db():
+        await interaction.response.send_message("⚠️ Udah di-set!", ephemeral=True)
         return
-    await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="set"))
+    await interaction.response.send_modal(AnonTemplateModal(channel_id=interaction.channel_id, mode="set"))
 
 
 @bot.tree.command(name="editanon", description="Edit template announcement")
@@ -725,24 +949,7 @@ async def unsetanon(interaction: discord.Interaction):
         return
     del db[ch_id]
     save_anon_db(db)
-    await interaction.response.send_message(f"🗑️ Setting dihapus.", ephemeral=True)
-
-
-@bot.tree.command(name="listanon", description="Lihat semua announcement channel")
-async def listanon(interaction: discord.Interaction):
-    db = load_anon_db()
-    guild_id = str(interaction.guild_id)
-    lines = []
-    for ch_id, cfg in db.items():
-        if cfg.get("guild_id") == guild_id:
-            ch = interaction.guild.get_channel(int(ch_id))
-            if ch:
-                lines.append(f"• {ch.mention}")
-    if not lines:
-        await interaction.response.send_message("📭 Belum ada.", ephemeral=True)
-        return
-    embed = discord.Embed(title="📢 Announcement Channels", description="\n".join(lines), color=COLOR_ANON)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message("🗑️ Setting dihapus.", ephemeral=True)
 
 
 @bot.tree.command(name="ping", description="Cek bot masih hidup")
@@ -808,7 +1015,6 @@ async def refresh_status_message(ch_id: str):
     cfg = db.get(ch_id)
     if not cfg:
         return
-
     channel = bot.get_channel(int(ch_id))
     if not channel:
         return
@@ -846,7 +1052,7 @@ async def refresh_status_message(ch_id: str):
 
 
 # ============================================================
-# TASK: AUTO-REFRESH
+# TASK: AUTO-REFRESH STATUS
 # ============================================================
 @tasks.loop(seconds=AUTO_STATUS_INTERVAL)
 async def auto_status_refresh():
@@ -865,11 +1071,9 @@ async def auto_status_refresh():
 # ============================================================
 @bot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
-    """Kalau ada user ganti status, langsung refresh."""
     db = load_status_db()
     if not db:
         return
-
     uid = str(after.id)
     for ch_id, cfg in db.items():
         if uid in cfg.get("user_ids", []):
@@ -887,9 +1091,14 @@ async def on_ready():
     print("=" * 60)
     print(f"🤖 Bot online: {bot.user}")
     print(f"🏠 Guilds: {[g.name for g in bot.guilds]}")
-    print(f"📁 QRIS: {list_qris_available()}")
-    print(f"📢 Anon: {list(load_anon_db().keys())}")
-    print(f"📊 Auto-status: {list(load_status_db().keys())}")
+
+    # Register persistent views buat get-role
+    for guild in bot.guilds:
+        try:
+            bot.add_view(GetRoleView(guild.id))
+            print(f"✅ GetRole view registered for '{guild.name}'")
+        except Exception as e:
+            print(f"⚠️ Gagal register GetRole view: {e}")
 
     try:
         synced = await bot.tree.sync()
