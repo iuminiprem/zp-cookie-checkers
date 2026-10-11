@@ -1,6 +1,8 @@
-# v3 - force rebuild
+# v5 - add announcement auto-bump feature
 import os
 import io
+import json
+import time
 import asyncio
 import aiohttp
 import discord
@@ -25,6 +27,12 @@ MAX_POLLS = 600
 # Folder QRIS
 QRIS_DIR = Path(__file__).parent / "qris"
 
+# Database announcement channel
+ANON_DB = Path(__file__).parent / "anon_channels.json"
+
+# Cooldown bump (detik) - biar gak spam
+BUMP_COOLDOWN = 5
+
 # === KATEGORI ===
 CATEGORIES = [
     {"key": "alive",        "name": "Alive",        "emoji": "🟢"},
@@ -37,11 +45,16 @@ CATEGORIES = [
 COLOR_CHECKING = 0x22d3ee
 COLOR_DONE     = 0x22c55e
 COLOR_ERROR    = 0xff4d6d
+COLOR_ANON     = 0x9b59b6
 
 # === BOT SETUP ===
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# State cooldown (in-memory)
+_last_bump = {}
 
 
 # === HELPER ===
@@ -127,6 +140,34 @@ def list_qris_available():
         if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
             names.add(f.stem.lower())
     return sorted(names)
+
+
+# === ANON DB HELPERS ===
+def load_anon_db() -> dict:
+    if not ANON_DB.exists():
+        return {}
+    try:
+        with open(ANON_DB, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Gagal load anon db: {e}")
+        return {}
+
+
+def save_anon_db(data: dict):
+    try:
+        with open(ANON_DB, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Gagal save anon db: {e}")
+
+
+def is_anon_channel(channel_id: int) -> bool:
+    return str(channel_id) in load_anon_db()
+
+
+def get_anon_config(channel_id: int) -> dict:
+    return load_anon_db().get(str(channel_id), {})
 
 
 # === SLASH COMMAND: /check ===
@@ -315,12 +356,244 @@ async def pay(interaction: discord.Interaction, target: str):
     await interaction.followup.send(embed=embed, file=file)
 
 
+# ============================================================
+# MODAL: INPUT TEMPLATE ANNOUNCEMENT
+# ============================================================
+class AnonTemplateModal(discord.ui.Modal, title="Set Pesan Template"):
+    template_input = discord.ui.TextInput(
+        label="Pesan Template",
+        style=discord.TextStyle.paragraph,
+        placeholder="Contoh:\n🔧 OPEN JASA JOKI ROBLOX\n\n✅ Joki Level\n✅ Joki Rank\n\n📩 DM untuk order!",
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, channel_id: int, mode: str = "set"):
+        super().__init__()
+        self.channel_id = channel_id
+        self.mode = mode
+
+        # Pre-fill kalau mode edit
+        if mode == "edit":
+            cfg = get_anon_config(channel_id)
+            if cfg.get("template"):
+                self.template_input.default = cfg["template"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        db = load_anon_db()
+        ch_id = str(self.channel_id)
+
+        if self.mode == "set":
+            db[ch_id] = {
+                "channel_id": ch_id,
+                "guild_id": str(interaction.guild_id),
+                "set_by": str(interaction.user.id),
+                "set_at": str(discord.utils.utcnow()),
+                "template": self.template_input.value,
+            }
+            save_anon_db(db)
+
+            embed = discord.Embed(
+                title="✅ Announcement Di-set!",
+                description=(
+                    f"Channel {interaction.channel.mention} sekarang **aktif**.\n\n"
+                    f"**Template:**\n"
+                    f"```\n{self.template_input.value}\n```\n"
+                    f"Setiap ada chat, bot bakal **bump** template ini.\n"
+                    f"Cooldown: **{BUMP_COOLDOWN} detik**."
+                ),
+                color=COLOR_ANON,
+            )
+            embed.set_footer(text=f"Di-set oleh {interaction.user.display_name}")
+            await interaction.response.send_message(embed=embed)
+
+        elif self.mode == "edit":
+            if ch_id not in db:
+                await interaction.response.send_message(
+                    "❌ Channel ini belum di-set. Pakai `/setanon` dulu.",
+                    ephemeral=True
+                )
+                return
+
+            db[ch_id]["template"] = self.template_input.value
+            save_anon_db(db)
+
+            embed = discord.Embed(
+                title="✅ Template Diupdate!",
+                description=(
+                    f"**Template baru:**\n"
+                    f"```\n{self.template_input.value}\n```"
+                ),
+                color=COLOR_DONE,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# === SLASH COMMAND: /setanon ===
+@bot.tree.command(name="setanon", description="Set channel ini jadi announcement (auto-bump pesan template)")
+async def setanon(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "🚫 Kamu butuh permission `Manage Messages`!",
+            ephemeral=True
+        )
+        return
+
+    ch_id = interaction.channel_id
+    db = load_anon_db()
+
+    if str(ch_id) in db:
+        await interaction.response.send_message(
+            f"⚠️ Channel {interaction.channel.mention} udah di-set!\n\n"
+            f"Pakai `/editanon` buat edit template.\n"
+            f"Pakai `/unsetanon` buat hapus setting.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="set"))
+
+
+# === SLASH COMMAND: /editanon ===
+@bot.tree.command(name="editanon", description="Edit template pesan announcement")
+async def editanon(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "🚫 Kamu butuh permission `Manage Messages`!",
+            ephemeral=True
+        )
+        return
+
+    ch_id = interaction.channel_id
+    db = load_anon_db()
+
+    if str(ch_id) not in db:
+        await interaction.response.send_message(
+            f"❌ Channel {interaction.channel.mention} belum di-set.\n"
+            f"Pakai `/setanon` dulu.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(AnonTemplateModal(channel_id=ch_id, mode="edit"))
+
+
+# === SLASH COMMAND: /unsetanon ===
+@bot.tree.command(name="unsetanon", description="Hapus setting announcement channel")
+async def unsetanon(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "🚫 Kamu butuh permission `Manage Messages`!",
+            ephemeral=True
+        )
+        return
+
+    ch_id = str(interaction.channel_id)
+    db = load_anon_db()
+
+    if ch_id not in db:
+        await interaction.response.send_message(
+            f"❌ Channel {interaction.channel.mention} bukan announcement channel!",
+            ephemeral=True
+        )
+        return
+
+    del db[ch_id]
+    save_anon_db(db)
+
+    embed = discord.Embed(
+        title="🗑️ Setting Dihapus",
+        description=f"Channel {interaction.channel.mention} udah **gak jadi** announcement channel lagi.",
+        color=COLOR_DONE,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# === SLASH COMMAND: /listanon ===
+@bot.tree.command(name="listanon", description="Lihat semua announcement channel di server ini")
+async def listanon(interaction: discord.Interaction):
+    db = load_anon_db()
+    guild_id = str(interaction.guild_id)
+
+    lines = []
+    for ch_id, cfg in db.items():
+        if cfg.get("guild_id") == guild_id:
+            ch = interaction.guild.get_channel(int(ch_id))
+            if ch:
+                lines.append(f"• {ch.mention}")
+
+    if not lines:
+        await interaction.response.send_message(
+            "📭 Belum ada announcement channel di server ini.\n\n"
+            "Set pakai `/setanon` di channel yang kamu mau.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📢 Announcement Channels",
+        description="\n".join(lines),
+        color=COLOR_ANON,
+    )
+    embed.set_footer(text=f"Total: {len(lines)} channel")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # === SLASH COMMAND: /ping ===
 @bot.tree.command(name="ping", description="Cek bot masih hidup")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"🏓 Pong! Latency: `{round(bot.latency * 1000)}ms`", ephemeral=True
     )
+
+
+# === EVENT: ON MESSAGE — AUTO BUMP ===
+@bot.event
+async def on_message(message: discord.Message):
+    # Skip bot sendiri
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    # Skip DM
+    if not message.guild:
+        await bot.process_commands(message)
+        return
+
+    # Cek apakah channel ini announcement channel
+    if not is_anon_channel(message.channel.id):
+        await bot.process_commands(message)
+        return
+
+    # Skip pesan kosong (cuma attachment/sticker)
+    if not message.content.strip():
+        await bot.process_commands(message)
+        return
+
+    # Cek cooldown
+    ch_id = message.channel.id
+    now = time.time()
+    last = _last_bump.get(ch_id, 0)
+
+    if now - last < BUMP_COOLDOWN:
+        await bot.process_commands(message)
+        return
+
+    # Bump!
+    cfg = get_anon_config(ch_id)
+    template = cfg.get("template", "")
+
+    if not template:
+        await bot.process_commands(message)
+        return
+
+    try:
+        await message.channel.send(template)
+        _last_bump[ch_id] = now
+    except discord.HTTPException as e:
+        print(f"[anon bump error] {e}")
+
+    await bot.process_commands(message)
 
 
 # === ON READY ===
@@ -331,6 +604,7 @@ async def on_ready():
         print(f"✅ Bot online: {bot.user}")
         print(f"✅ Synced {len(synced)} slash commands")
         print(f"💳 QRIS tersedia: {list_qris_available()}")
+        print(f"📢 Anon channels: {list(load_anon_db().keys())}")
         if WHITELIST:
             print(f"🔒 Whitelist aktif: {WHITELIST}")
         else:
